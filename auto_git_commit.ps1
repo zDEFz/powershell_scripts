@@ -1,58 +1,168 @@
-# Load the FSWatcher module (install if not present)
-if (-not (Get-Module -ListAvailable -Name FSWatcherEngineEvent)) {
-    Install-Module -Name FSWatcherEngineEvent -Scope CurrentUser -Force
+# Parameters
+$scanPath = "C:\Users\blu\Documents"
+$debounceDelaySeconds = 5
+
+# Function to check if a path is inside a .git folder
+function IsInGitFolder {
+    param([string]$path)
+
+    if ([string]::IsNullOrEmpty($path)) { return $false }
+
+    $fullPath = [System.IO.Path]::GetFullPath($path).TrimEnd('\','/')
+    $parts = $fullPath -split '[\\/]+'
+    return $parts -contains '.git'
 }
-Import-Module FSWatcherEngineEvent
 
-# Use an approved verb per PSScriptAnalyzer
-function Start-AutoGitWatcher {
-    param (
-        [Parameter(Mandatory)]
-        [string]$RepoPath
-    )
+# Function to run git commit & push for a repo folder
+function CommitAndPushRepo {
+    param([string]$repoPath)
 
-    if (-not (Test-Path $RepoPath)) {
-        Write-Warning "Path not found: $RepoPath"
-        return
+    Write-Host "[INFO] Committing changes in repo: $repoPath"
+
+    Push-Location $repoPath
+
+    git add -A | Out-Null
+    $status = git status --porcelain
+
+    if (-not [string]::IsNullOrEmpty($status)) {
+        $message = "Auto-commit: Changes detected on $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+        git commit -m $message | Out-Null
+        git push | Out-Null
+        Write-Host "[INFO] Changes committed and pushed."
+    }
+    else {
+        Write-Host "[INFO] No changes to commit."
     }
 
-    $cleanPathId = "AutoGit_$($RepoPath -replace '[:\\]', '_')"
-    Write-Host "Watching: $RepoPath" -ForegroundColor Cyan
-
-    # Set up the file system watcher
-    New-FileSystemWatcher `
-        -SourceIdentifier $cleanPathId `
-        -Path $RepoPath `
-        -IncludeSubdirectories `
-        -Filter '*' `
-        -NotifyFilter FileName, LastWrite |
-    Register-EngineEvent -SourceIdentifier $cleanPathId -Action {
-        try {
-            Start-Sleep -Milliseconds 500  # debounce
-
-            $repo = $Event.Sender.Path
-            Set-Location -LiteralPath $repo
-
-            # Only commit if there are changes
-            if (-not (& git diff --quiet) -or -not (& git diff --cached --quiet)) {
-                & git add -A
-                $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-                & git commit -m "Auto-commit on change at $timestamp" 2>$null
-                & git push
-                Write-Host "✅ Auto-committed: $repo @ $timestamp" -ForegroundColor Green
-            }
-        } catch {
-            Write-Error "Git operation failed in ${repo}: $_"
-        }
-    } | Out-Null
+    Pop-Location
 }
 
-# START WATCHING YOUR REPOS
-Start-AutoGitWatcher -RepoPath "C:\Users\blu\Documents\digiface-usb-config"
-Start-AutoGitWatcher -RepoPath "C:\Users\blu\Documents\ahk_scripts"
-Start-AutoGitWatcher -RepoPath "C:\Users\blu\Documents\powershell_scripts"
+# Scan for Git repos
+function Get-GitRepos {
+    param([string]$rootPath)
 
-Write-Host "`nWatching for changes... Press Ctrl+C to stop." -ForegroundColor Yellow
-while ($true) {
-    Wait-Event -Timeout 10 | Out-Null
+    $repos = @()
+    $folders = Get-ChildItem -Path $rootPath -Directory -Recurse -ErrorAction SilentlyContinue
+
+    foreach ($folder in $folders) {
+        if (Test-Path (Join-Path $folder.FullName ".git")) {
+            $repos += $folder.FullName
+        }
+    }
+
+    return $repos
+}
+
+# Debounce state: hash table repo path => timer
+$debounceTimers = @{}
+
+# Called when a file changes in a repo
+function OnFileChanged {
+    param([string]$filePath)
+
+    $normalizedFilePath = [System.IO.Path]::GetFullPath($filePath).ToLowerInvariant()
+
+    foreach ($repoPath in $gitRepos) {
+        $normalizedRepoPath = [System.IO.Path]::GetFullPath($repoPath).ToLowerInvariant()
+
+        if ($normalizedFilePath.StartsWith($normalizedRepoPath)) {
+            if ($debounceTimers.ContainsKey($repoPath)) {
+                $debounceTimers[$repoPath].Stop()
+                $debounceTimers[$repoPath].Start()
+            }
+            else {
+                $timer = New-Object System.Timers.Timer
+                $timer.Interval = $debounceDelaySeconds * 1000
+                $timer.AutoReset = $false
+                $timer.Enabled = $true
+
+                $repoForTimer = $repoPath  # capture in closure
+                Register-ObjectEvent -InputObject $timer -EventName Elapsed -Action {
+                    CommitAndPushRepo $repoForTimer
+                    $debounceTimers.Remove($repoForTimer) | Out-Null
+                } | Out-Null
+
+                $debounceTimers[$repoPath] = $timer
+            }
+
+            break
+        }
+    }
+}
+
+# --- Main Execution ---
+
+Write-Host "[INFO] Scanning for Git repos in $scanPath"
+$gitRepos = Get-GitRepos -rootPath $scanPath
+
+Write-Host "[INFO] Found $($gitRepos.Count) Git repos:"
+foreach ($repo in $gitRepos) {
+    Write-Host " - $repo"
+}
+
+# Set up watchers for each repo
+$watchers = @()
+
+foreach ($repoPath in $gitRepos) {
+    Write-Host "[INFO] Starting watcher on $repoPath"
+
+    $fsw = New-Object System.IO.FileSystemWatcher
+    $fsw.Path = $repoPath
+    $fsw.IncludeSubdirectories = $true
+    $fsw.NotifyFilter = [IO.NotifyFilters]'FileName, DirectoryName, LastWrite'
+
+    # Event handler function
+    $handleChange = {
+        $eventArgsLocal = $Event.SourceEventArgs
+
+        if ($null -eq $eventArgsLocal.FullPath -or [string]::IsNullOrEmpty($eventArgsLocal.FullPath)) {
+            return
+        }
+
+        if (IsInGitFolder $eventArgsLocal.FullPath) {
+            return
+        }
+
+        $eventType = $Event.EventIdentifier -replace '.*_', ''
+        Write-Host "[EVENT] Change detected at $($eventArgsLocal.FullPath) ($eventType)"
+        OnFileChanged $eventArgsLocal.FullPath
+    }
+
+    # Register all event types
+    Register-ObjectEvent $fsw Changed -SourceIdentifier "Changed_$repoPath" -Action $handleChange | Out-Null
+    Register-ObjectEvent $fsw Created -SourceIdentifier "Created_$repoPath" -Action $handleChange | Out-Null
+    Register-ObjectEvent $fsw Deleted -SourceIdentifier "Deleted_$repoPath" -Action $handleChange | Out-Null
+    Register-ObjectEvent $fsw Renamed -SourceIdentifier "Renamed_$repoPath" -Action {
+        $eventArgsLocal = $Event.SourceEventArgs
+        if ($null -eq $eventArgsLocal.FullPath -or [string]::IsNullOrEmpty($eventArgsLocal.FullPath) -or
+            $null -eq $eventArgsLocal.OldFullPath -or [string]::IsNullOrEmpty($eventArgsLocal.OldFullPath)) {
+            return
+        }
+
+        if (IsInGitFolder $eventArgsLocal.FullPath -or IsInGitFolder $eventArgsLocal.OldFullPath) {
+            return
+        }
+
+        Write-Host "[EVENT] File renamed from $($eventArgsLocal.OldFullPath) to $($eventArgsLocal.FullPath)"
+        OnFileChanged $eventArgsLocal.FullPath
+    } | Out-Null
+
+    $fsw.EnableRaisingEvents = $true
+    $watchers += $fsw
+}
+
+Write-Host "[INFO] Watching for changes... Press Ctrl+C to stop."
+
+# Keep script running until Ctrl+C
+try {
+    while ($true) {
+        Start-Sleep -Seconds 1
+    }
+}
+finally {
+    # Cleanup: unregister event handlers and dispose watchers
+    Get-EventSubscriber | Unregister-Event
+    foreach ($w in $watchers) {
+        $w.Dispose()
+    }
 }
