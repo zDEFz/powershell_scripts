@@ -1,3 +1,5 @@
+# WIP
+
 # Parameters
 $scanPath = "C:\Users\blu\Documents"
 $debounceDelaySeconds = 5
@@ -17,6 +19,11 @@ function IsInGitFolder {
 function CommitAndPushRepo {
     param([string]$repoPath)
 
+    if (-not (Test-Path $repoPath)) {
+        Write-Host "[ERROR] Repo path does not exist: $repoPath"
+        return
+    }
+
     Write-Host "[INFO] Committing changes in repo: $repoPath"
 
     Push-Location $repoPath
@@ -26,7 +33,9 @@ function CommitAndPushRepo {
 
     if (-not [string]::IsNullOrEmpty($status)) {
         $message = "Auto-commit: Changes detected on $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+        Write-Host "[DEBUG] Committing with message: $message"
         git commit -m $message | Out-Null
+        Write-Host "[DEBUG] Pushing changes..."
         git push | Out-Null
         Write-Host "[INFO] Changes committed and pushed."
     }
@@ -76,11 +85,11 @@ function OnFileChanged {
                 $timer.AutoReset = $false
                 $timer.Enabled = $true
 
-                $repoForTimer = $repoPath  # capture in closure
                 Register-ObjectEvent -InputObject $timer -EventName Elapsed -Action {
-                    CommitAndPushRepo $repoForTimer
-                    $debounceTimers.Remove($repoForTimer) | Out-Null
-                } | Out-Null
+                    $path = $Event.MessageData
+                    CommitAndPushRepo $path
+                    $debounceTimers.Remove($path) | Out-Null
+                } -MessageData $repoPath | Out-Null
 
                 $debounceTimers[$repoPath] = $timer
             }
