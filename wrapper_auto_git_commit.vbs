@@ -1,5 +1,3 @@
-
-
 Set objShell = CreateObject("Wscript.Shell")
 # Setup initially!
 # objShell.Run "powershell.exe -ExecutionPolicy Bypass -File ""C:\Users\blu\Documents\powershell_scripts\install_file_watcher_modules.ps1""", 1
