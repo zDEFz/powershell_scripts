@@ -1,9 +1,9 @@
+# Define task properties
 $TaskName = "RestartSunshineOnWake"
 $Action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -Command ""Start-Sleep -s 5; Restart-Service sunshine -Force"""
-$Trigger = New-ScheduledTaskTrigger -AtLogOn
 $User = "SYSTEM" # Runs with highest possible privileges
 
-# This part specifically targets the "Wake from Sleep" Event ID 1
+# XML Trigger for Wake From Sleep (Event ID 1)
 $XmlTrigger = @"
 <QueryList>
   <Query Id="0" Path="System">
@@ -12,4 +12,8 @@ $XmlTrigger = @"
 </QueryList>
 "@
 
-Register-ScheduledTask -TaskName $TaskName -Action $Action -Xml (Get-ScheduledTask -TaskName "Adobe Flash Player Update" | Export-ScheduledTask | % { $_ -replace '(?s)<Triggers>.*</Triggers>', "<Triggers><EventTrigger>$XmlTrigger</EventTrigger></Triggers>" }) -User $User -Force
+# Create Event Trigger
+$Trigger = New-ScheduledTaskTrigger -Xml $XmlTrigger
+
+# Register the new scheduled task
+Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -User $User -Force
